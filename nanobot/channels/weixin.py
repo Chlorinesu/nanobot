@@ -49,6 +49,10 @@ ITEM_VIDEO = 5
 MESSAGE_TYPE_USER = 1
 MESSAGE_TYPE_BOT = 2
 
+# Typing status codes (1 = typing, 2 = canceled)
+TYPING_STATUS_TYPING = 1
+TYPING_STATUS_CANCELED = 2
+
 # MessageState
 MESSAGE_STATE_FINISH = 2
 
@@ -124,6 +128,8 @@ class WeixinConfig(Base):
     state_dir: str = ""  # Default: ~/.nanobot/weixin/
     poll_timeout: int = DEFAULT_LONG_POLL_TIMEOUT_S  # seconds for long-poll
 
+    streaming: bool = True  # Enable streaming support (requires send_delta override)
+
 
 class WeixinChannel(BaseChannel):
     """
@@ -159,6 +165,7 @@ class WeixinChannel(BaseChannel):
         self._session_pause_until: float = 0.0
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._typing_tickets: dict[str, dict[str, Any]] = {}
+
 
     # ------------------------------------------------------------------
     # State persistence
@@ -940,6 +947,7 @@ class WeixinChannel(BaseChannel):
             pass
 
     async def send(self, msg: OutboundMessage) -> None:
+
         if not self._client or not self._token:
             logger.warning("WeChat client not initialized or not authenticated")
             return
@@ -1110,6 +1118,158 @@ class WeixinChannel(BaseChannel):
         except Exception as e:
             logger.debug("WeChat typing clear failed for {}: {}", chat_id, e)
 
+    async def send_delta(self, chat_id, delta, metadata=None):
+        """
+        Improved streaming: avoid sending markdown headings as separate messages, and avoid empty/meaningless paragraphs.
+        Buffer headings with their content, only send when a real content block follows or at stream end.
+        """
+        import re
+        if not hasattr(self, "_stream_buffers"):
+            self._stream_buffers = {}
+        if not hasattr(self, "_pending_heading"):
+            self._pending_heading = {}
+
+        buf = self._stream_buffers.get(chat_id, "")
+        ctx_token = self._context_tokens.get(chat_id, "")
+
+        if not buf: # Only send typing status on the first delta of a stream (when buffer is empty)
+            await self._send_typing(chat_id, status=TYPING_STATUS_TYPING)  # Send typing status on each delta
+
+        buf = buf + delta
+
+        # Split by double newline, but keep the delimiter
+        segments = re.split(r'(\n\n)', buf)
+        message_parts = []   
+        temp = ''
+        for seg in segments:
+            if seg == '\n\n':
+                if temp:
+                    message_parts.append(temp)
+                temp = ''
+            else:
+                temp += seg
+        if temp:
+            # Last part, may be incomplete
+            incomplete = temp
+        else:
+            incomplete = ''
+
+        # Helper: is heading (e.g. '## 1', '# 标题', '### Something')
+        def is_heading(s):
+            return bool(re.match(r'\s*#+\s*\S+', s.strip()))
+
+        # Helper: is empty or only whitespace/markdown
+        def is_meaningless(s):
+            return not s.strip() or s.strip() in {'---', '***', '___'}
+
+        # Helper: render **bold** as 【bold】 to preserve emphasis without markdown
+        def render_bold_in_text(s):
+            return re.sub(r'\*\*(.+?)\*\*', r'【\1】', s)
+
+        # Helper: render ```code``` blocks with --- {lang} --- delimiters, preserving language if specified
+        def render_code_block_in_text(s):
+            def process_code_block(match):
+                lang = match.group(1).strip()  # 语言：python / js 等
+                code = match.group(2).rstrip() # 代码内容
+                
+                # 按你的格式生成开头行
+                lang_part = f" {lang}" if lang else ""
+                start_line = f"--- {lang_part} ---"
+                
+                # 结尾行长度 = 开头行长度，保证视觉完全对齐
+                end_line = "-" * len(start_line)
+                
+                return f"{start_line}\n{code}\n{end_line}"
+
+            # 匹配所有 ```语言...``` 代码块（支持多行）
+            return re.sub(
+                r'```([^\n]*)\n(.*?)\n```',
+                process_code_block,
+                s,
+                flags=re.DOTALL
+            )
+
+        # Helper: render
+        def render_headings_in_text(s):
+            h2_count = 0
+            def number_to_emoji(n):
+                # 0️⃣1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣8️⃣9️⃣🔟
+                if n == 10:
+                    return "\U0001F51F"
+                return chr(48 + n) + "\uFE0F\u20E3"
+            def replace_title1(match):
+                title = match.group(2).strip()
+                return f"📌 【{title}】"
+            def replace_title2(match):
+                nonlocal h2_count
+                h2_count += 1
+                title = match.group(2).strip()
+                num_emoji = number_to_emoji(h2_count)
+                return f"{num_emoji} 【{title}】"
+            def replace_title3(match):
+                title = match.group(3).strip()
+                return f"{title}"
+            s = re.sub(r'^#\s+(.*)', replace_title1, s, flags=re.MULTILINE)
+            s = re.sub(r'^##\s+(.*)', replace_title2, s, flags=re.MULTILINE)
+            s = re.sub(r'^###\s+(.*)', replace_title3, s, flags=re.MULTILINE)
+            return s
+
+        def render_markdown_in_text(s):
+            s = render_bold_in_text(s)
+            s = render_code_block_in_text(s)
+            s = render_headings_in_text(s)
+            return s
+
+        # Pending heading logic
+        pending = self._pending_heading.get(chat_id, None)
+        text_to_send = ''
+        for part in message_parts:
+            if is_meaningless(part):
+                continue
+            if is_heading(part):
+                # Buffer heading, don't send yet
+                if pending:
+                    # If previous heading still pending, send it (no content followed)
+                    text_to_send = pending
+                pending = part.strip()
+            else:
+                # If heading pending, combine and send
+                if pending:
+                    text_to_send = f"{pending}\n{part.strip()}"
+                    pending = None
+                else:
+                    text_to_send = part.strip()
+            if text_to_send:
+                text_to_send = render_markdown_in_text(text_to_send)
+                logger.debug("WeChat send_delta sending: chat_id={} text='{}'", chat_id, text_to_send)
+                await self._send_text(chat_id, text_to_send, ctx_token)
+                await self._send_typing(chat_id, status=TYPING_STATUS_CANCELED) 
+                logger.debug("WeChat send_delta sent: chat_id={}", chat_id)
+                text_to_send = ''
+
+        # Save pending heading and incomplete buffer
+        self._pending_heading[chat_id] = pending
+        self._stream_buffers[chat_id] = incomplete
+
+        # On stream end, flush any remaining content
+        if metadata and metadata.get("_stream_end"):
+            final = ''
+            if pending:
+                final = pending
+            if incomplete and not is_meaningless(incomplete):
+                if final:
+                    final = f"{final}\n{incomplete.strip()}"
+                else:
+                    final = incomplete.strip()
+            if final:
+                final = render_markdown_in_text(final)
+                logger.debug("WeChat send_delta sending: chat_id={} text='{}'", chat_id, text_to_send)
+                await self._send_text(chat_id, final, ctx_token)
+                logger.debug("WeChat send_delta sent: chat_id={} (final)", chat_id)
+            self._pending_heading[chat_id] = None
+            self._stream_buffers[chat_id] = ''
+        return
+
     async def _send_text(
         self,
         to_user_id: str,
@@ -1149,6 +1309,46 @@ class WeixinChannel(BaseChannel):
                 data.get("errmsg", ""),
             )
 
+    async def _get_config(self, to_user_id: str) -> dict[str, Any]:
+        """Get config for a user, including typing_ticket."""
+        # 尝试从通过 getConfig 主动获取
+        try:
+            # 主动请求 getConfig
+            body = {"ilink_user_id": to_user_id, "base_info": BASE_INFO}
+            resp = await self._api_post("ilink/bot/getconfig", body)
+            # logger.info("[Weixin] getConfig for user_id={}", to_user_id)
+            return resp
+        except Exception as e:
+            logger.warning("[Weixin] Failed to get config for user_id={}: {}", to_user_id, e)
+            return {}
+
+    async def _send_typing(self, to_user_id: str, status: int = 1) -> None:
+        """
+        发送正在输入/取消输入状态到微信服务器。
+        该状态会持续15秒，重复发送会先取消输入状态然后重新显示正在输入
+        该方法比较耗时，不要一直调用，建议在 send_delta 开始时调用一次 sendTyping(status=1)，结束时调用一次 sendTyping(status=2)
+        status: 1=typing, 2=cancel typing
+        """
+        # 自动获取 typing_ticket
+        ticket = (await self._get_config(to_user_id)).get("typing_ticket")
+        # logger.info("[Weixin] auto-fetched typing_ticket for user_id={}: {}", to_user_id, ticket)
+
+        if not ticket:
+            logger.warning("[Weixin] typing_ticket missing, skip sendTyping for user_id={}", to_user_id)
+            return
+        body = {
+            "ilink_user_id": to_user_id,
+            "typing_ticket": ticket,
+            "status": status,
+            "base_info": BASE_INFO,
+        }
+        try:
+            logger.debug("WeChat sendTyping sending: user_id={} status={}", to_user_id, status)
+            await self._api_post("ilink/bot/sendtyping", body)
+            logger.debug("WeChat sendTyping sent: user_id={} status={}", to_user_id, status)
+        except Exception as e:
+            logger.warning("WeChat sendTyping failed: {}", e)
+
     async def _send_media_file(
         self,
         to_user_id: str,
@@ -1165,6 +1365,7 @@ class WeixinChannel(BaseChannel):
         5. Send a ``sendmessage`` with the appropriate media item referencing the upload.
         """
         p = Path(media_path)
+
         if not p.is_file():
             raise FileNotFoundError(f"Media file not found: {media_path}")
 
