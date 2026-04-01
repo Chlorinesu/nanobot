@@ -58,7 +58,7 @@ class MessageTool(Tool):
         return (
             "Send a message to the user, optionally with file attachments. "
             "This is the ONLY way to deliver files (images, documents, audio, video) to the user. "
-            "Use the 'media' parameter with file paths to attach files. "
+            "Use the 'media' parameter with **absolute file paths** to attach files. "
             "Do NOT use read_file to send files — that only reads content for your own analysis."
         )
 
