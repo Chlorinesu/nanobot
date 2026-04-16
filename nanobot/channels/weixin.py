@@ -1118,12 +1118,107 @@ class WeixinChannel(BaseChannel):
         except Exception as e:
             logger.debug("WeChat typing clear failed for {}: {}", chat_id, e)
 
+    @staticmethod
+    def _is_markdown_horizontal_rule(text: str) -> bool:
+        """Return True when text is a markdown horizontal rule line."""
+        stripped = text.strip()
+        if not stripped:
+            return False
+        return bool(re.match(r"^[ \t]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$", stripped))
+
+    def _normalize_stream_text(self, text: str) -> str:
+        """Drop markdown horizontal rules so they act as boundaries and are never sent."""
+        hr_re = re.compile(r"(?m)^[ \t]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$")
+        return hr_re.sub("", text)
+
+    def _split_stream_message_parts(self, text: str) -> tuple[list[str], str]:
+        """Split stream text by double newline and keep tail as incomplete chunk."""
+        normalized = self._normalize_stream_text(text)
+        segments = re.split(r"(\n\n)", normalized)
+        message_parts: list[str] = []
+        temp = ""
+        for seg in segments:
+            if seg == "\n\n":
+                if temp:
+                    message_parts.append(temp)
+                temp = ""
+            else:
+                temp += seg
+        incomplete = temp if temp else ""
+        return message_parts, incomplete
+
+    @staticmethod
+    def _is_stream_heading(text: str) -> bool:
+        """Return True when text is a markdown heading line."""
+        return bool(re.match(r"\s*#+\s*\S+", text.strip()))
+
+    def _is_meaningless_stream_part(self, text: str) -> bool:
+        """Skip empty parts and markdown-only separators."""
+        stripped = text.strip()
+        return not stripped or self._is_markdown_horizontal_rule(stripped)
+
+    async def _send_stream_chunk(self, chat_id: str, text: str, ctx_token: str) -> None:
+        """Send one completed stream chunk and stop the typing indicator for it."""
+        if not text:
+            return
+        logger.debug("WeChat send_delta sending: chat_id={} text='{}'", chat_id, text)
+        await self._send_text(chat_id, text, ctx_token)
+        await self._send_typing(chat_id, status=TYPING_STATUS_CANCELED)
+        logger.debug("WeChat send_delta sent: chat_id={}", chat_id)
+
+    async def _consume_stream_parts(
+        self,
+        chat_id: str,
+        message_parts: list[str],
+        ctx_token: str,
+        pending: str | None,
+    ) -> str | None:
+        """Consume complete stream parts and return the updated pending heading."""
+        for part in message_parts:
+            if self._is_meaningless_stream_part(part):
+                continue
+
+            stripped = part.strip()
+            if self._is_stream_heading(part):
+                if pending:
+                    await self._send_stream_chunk(chat_id, pending, ctx_token)
+                pending = stripped
+                continue
+
+            if pending:
+                await self._send_stream_chunk(chat_id, f"{pending}\n{stripped}", ctx_token)
+                pending = None
+            else:
+                await self._send_stream_chunk(chat_id, stripped, ctx_token)
+
+        return pending
+
+    async def _flush_stream_end(
+        self,
+        chat_id: str,
+        pending: str | None,
+        incomplete: str,
+        ctx_token: str,
+    ) -> None:
+        """Flush any remaining buffered stream content at end of stream."""
+        final = pending or ""
+        if incomplete and not self._is_meaningless_stream_part(incomplete):
+            stripped = incomplete.strip()
+            final = f"{final}\n{stripped}" if final else stripped
+
+        if final:
+            logger.debug("WeChat send_delta sending: chat_id={} text='{}'", chat_id, final)
+            await self._send_text(chat_id, final, ctx_token)
+            logger.debug("WeChat send_delta sent: chat_id={} (final)", chat_id)
+
+        self._pending_heading[chat_id] = None
+        self._stream_buffers[chat_id] = ""
+
     async def send_delta(self, chat_id, delta, metadata=None):
         """
         Improved streaming: avoid sending markdown headings as separate messages, and avoid empty/meaningless paragraphs.
         Buffer headings with their content, only send when a real content block follows or at stream end.
         """
-        import re
         if not hasattr(self, "_stream_buffers"):
             self._stream_buffers = {}
         if not hasattr(self, "_pending_heading"):
@@ -1136,81 +1231,14 @@ class WeixinChannel(BaseChannel):
             await self._send_typing(chat_id, status=TYPING_STATUS_TYPING)  # Send typing status on each delta
 
         buf = buf + delta
-
-        # Split by double newline, but keep the delimiter
-        segments = re.split(r'(\n\n)', buf)
-        message_parts = []   
-        temp = ''
-        for seg in segments:
-            if seg == '\n\n':
-                if temp:
-                    message_parts.append(temp)
-                temp = ''
-            else:
-                temp += seg
-        if temp:
-            # Last part, may be incomplete
-            incomplete = temp
-        else:
-            incomplete = ''
-
-        # Helper: is heading (e.g. '## 1', '# 标题', '### Something')
-        def is_heading(s):
-            return bool(re.match(r'\s*#+\s*\S+', s.strip()))
-
-        # Helper: is empty or only whitespace/markdown
-        def is_meaningless(s):
-            return not s.strip() or s.strip() in {'---', '***', '___'}
-
-
-        # Pending heading logic
+        message_parts, incomplete = self._split_stream_message_parts(buf)
         pending = self._pending_heading.get(chat_id, None)
-        text_to_send = ''
-        for part in message_parts:
-            if is_meaningless(part):
-                continue
-            if is_heading(part):
-                # Buffer heading, don't send yet
-                if pending:
-                    # If previous heading still pending, send it (no content followed)
-                    text_to_send = pending
-                pending = part.strip()
-            else:
-                # If heading pending, combine and send
-                if pending:
-                    text_to_send = f"{pending}\n{part.strip()}"
-                    pending = None
-                else:
-                    text_to_send = part.strip()
-            if text_to_send:
-                # text_to_send = render_markdown_in_text(text_to_send)
-                logger.debug("WeChat send_delta sending: chat_id={} text='{}'", chat_id, text_to_send)
-                await self._send_text(chat_id, text_to_send, ctx_token)
-                await self._send_typing(chat_id, status=TYPING_STATUS_CANCELED) 
-                logger.debug("WeChat send_delta sent: chat_id={}", chat_id)
-                text_to_send = ''
-
-        # Save pending heading and incomplete buffer
+        pending = await self._consume_stream_parts(chat_id, message_parts, ctx_token, pending)
         self._pending_heading[chat_id] = pending
         self._stream_buffers[chat_id] = incomplete
 
-        # On stream end, flush any remaining content
         if metadata and metadata.get("_stream_end"):
-            final = ''
-            if pending:
-                final = pending
-            if incomplete and not is_meaningless(incomplete):
-                if final:
-                    final = f"{final}\n{incomplete.strip()}"
-                else:
-                    final = incomplete.strip()
-            if final:
-                # final = render_markdown_in_text(final)
-                logger.debug("WeChat send_delta sending: chat_id={} text='{}'", chat_id, text_to_send)
-                await self._send_text(chat_id, final, ctx_token)
-                logger.debug("WeChat send_delta sent: chat_id={} (final)", chat_id)
-            self._pending_heading[chat_id] = None
-            self._stream_buffers[chat_id] = ''
+            await self._flush_stream_end(chat_id, pending, incomplete, ctx_token)
         return
 
     async def _send_text(
