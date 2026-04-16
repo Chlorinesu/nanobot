@@ -1126,15 +1126,10 @@ class WeixinChannel(BaseChannel):
             return False
         return bool(re.match(r"^[ \t]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$", stripped))
 
-    def _normalize_stream_text(self, text: str) -> str:
-        """Drop markdown horizontal rules so they act as boundaries and are never sent."""
-        hr_re = re.compile(r"(?m)^[ \t]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$")
-        return hr_re.sub("", text)
-
     def _split_stream_message_parts(self, text: str) -> tuple[list[str], str]:
         """Split stream text by double newline and keep tail as incomplete chunk."""
-        normalized = self._normalize_stream_text(text)
-        segments = re.split(r"(\n\n)", normalized)
+        segments = re.split(r"(\n\n)", text)
+        logger.debug("Split stream into segments: {}", segments)
         message_parts: list[str] = []
         temp = ""
         for seg in segments:
@@ -1152,11 +1147,6 @@ class WeixinChannel(BaseChannel):
         """Return True when text is a markdown heading line."""
         return bool(re.match(r"\s*#+\s*\S+", text.strip()))
 
-    def _is_meaningless_stream_part(self, text: str) -> bool:
-        """Skip empty parts and markdown-only separators."""
-        stripped = text.strip()
-        return not stripped or self._is_markdown_horizontal_rule(stripped)
-
     async def _send_stream_chunk(self, chat_id: str, text: str, ctx_token: str) -> None:
         """Send one completed stream chunk and stop the typing indicator for it."""
         if not text:
@@ -1165,6 +1155,23 @@ class WeixinChannel(BaseChannel):
         await self._send_text(chat_id, text, ctx_token)
         await self._send_typing(chat_id, status=TYPING_STATUS_CANCELED)
         logger.debug("WeChat send_delta sent: chat_id={}", chat_id)
+
+    def _split_stream_part_at_horizontal_rule(self, part: str) -> list[str]:
+        """Split a message part around markdown horizontal rules and drop the rule lines."""
+        rule_re = re.compile(r"(?m)^[ \t]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$")
+        fragments: list[str] = []
+        start = 0
+        for match in rule_re.finditer(part):
+            prefix = part[start:match.start()]
+            if prefix:
+                fragments.append(prefix)
+            start = match.end()
+            while start < len(part) and part[start] in "\r\n":
+                start += 1
+        suffix = part[start:]
+        if suffix:
+            fragments.append(suffix)
+        return fragments
 
     async def _consume_stream_parts(
         self,
@@ -1175,21 +1182,24 @@ class WeixinChannel(BaseChannel):
     ) -> str | None:
         """Consume complete stream parts and return the updated pending heading."""
         for part in message_parts:
-            if self._is_meaningless_stream_part(part):
+            fragments = self._split_stream_part_at_horizontal_rule(part)
+            if not fragments:
                 continue
 
-            stripped = part.strip()
-            if self._is_stream_heading(part):
+            for fragment in fragments:
+
+                stripped = fragment.strip()
+                if self._is_stream_heading(fragment):
+                    if pending:
+                        await self._send_stream_chunk(chat_id, pending, ctx_token)
+                    pending = stripped
+                    continue
+
                 if pending:
-                    await self._send_stream_chunk(chat_id, pending, ctx_token)
-                pending = stripped
-                continue
-
-            if pending:
-                await self._send_stream_chunk(chat_id, f"{pending}\n{stripped}", ctx_token)
-                pending = None
-            else:
-                await self._send_stream_chunk(chat_id, stripped, ctx_token)
+                    await self._send_stream_chunk(chat_id, f"{pending}\n{stripped}", ctx_token)
+                    pending = None
+                else:
+                    await self._send_stream_chunk(chat_id, stripped, ctx_token)
 
         return pending
 
@@ -1202,14 +1212,13 @@ class WeixinChannel(BaseChannel):
     ) -> None:
         """Flush any remaining buffered stream content at end of stream."""
         final = pending or ""
-        if incomplete and not self._is_meaningless_stream_part(incomplete):
+        if incomplete:
             stripped = incomplete.strip()
             final = f"{final}\n{stripped}" if final else stripped
 
         if final:
             logger.debug("WeChat send_delta sending: chat_id={} text='{}'", chat_id, final)
             await self._send_text(chat_id, final, ctx_token)
-            logger.debug("WeChat send_delta sent: chat_id={} (final)", chat_id)
 
         self._pending_heading[chat_id] = None
         self._stream_buffers[chat_id] = ""
@@ -1226,6 +1235,8 @@ class WeixinChannel(BaseChannel):
 
         buf = self._stream_buffers.get(chat_id, "")
         ctx_token = self._context_tokens.get(chat_id, "")
+
+        logger.debug("WeChat send_delta received: chat_id={} delta='{}'", chat_id, delta)
 
         if not buf: # Only send typing status on the first delta of a stream (when buffer is empty)
             await self._send_typing(chat_id, status=TYPING_STATUS_TYPING)  # Send typing status on each delta
@@ -1287,7 +1298,6 @@ class WeixinChannel(BaseChannel):
             # 主动请求 getConfig
             body = {"ilink_user_id": to_user_id, "base_info": BASE_INFO}
             resp = await self._api_post("ilink/bot/getconfig", body)
-            # logger.info("[Weixin] getConfig for user_id={}", to_user_id)
             return resp
         except Exception as e:
             logger.warning("[Weixin] Failed to get config for user_id={}: {}", to_user_id, e)
