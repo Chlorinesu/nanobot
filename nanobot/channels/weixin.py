@@ -91,7 +91,7 @@ MAX_QR_REFRESH_COUNT = 3
 TYPING_STATUS_TYPING = 1
 TYPING_STATUS_CANCEL = 2
 TYPING_TICKET_TTL_S = 24 * 60 * 60
-TYPING_KEEPALIVE_INTERVAL_S = 5
+TYPING_KEEPALIVE_INTERVAL_S = 10  # 经测试，一次send_typing状态持续15s
 CONFIG_CACHE_INITIAL_RETRY_S = 2
 CONFIG_CACHE_MAX_RETRY_S = 60 * 60
 
@@ -1152,8 +1152,12 @@ class WeixinChannel(BaseChannel):
         if not text:
             return
         logger.debug("WeChat send_delta sending: chat_id={} text='{}'", chat_id, text)
+        await asyncio.sleep(max(len(text) * 0.02 - 1, 0))  # 模拟人类的发送延迟
         await self._send_text(chat_id, text, ctx_token)
-        await self._send_typing(chat_id, status=TYPING_STATUS_CANCELED)
+        await asyncio.sleep(1)  # 微信发送消息时有延迟，但stop_typing会马上生效，因此这里对齐这个延迟
+        await self._stop_typing(chat_id, clear_remote=True)
+        await asyncio.sleep(1)
+        await self._start_typing(chat_id, ctx_token)
         logger.debug("WeChat send_delta sent: chat_id={}", chat_id)
 
     def _split_stream_part_at_horizontal_rule(self, part: str) -> list[str]:
@@ -1238,9 +1242,6 @@ class WeixinChannel(BaseChannel):
 
         logger.debug("WeChat send_delta received: chat_id={} delta='{}'", chat_id, delta)
 
-        if not buf: # Only send typing status on the first delta of a stream (when buffer is empty)
-            await self._send_typing(chat_id, status=TYPING_STATUS_TYPING)  # Send typing status on each delta
-
         buf = buf + delta
         message_parts, incomplete = self._split_stream_message_parts(buf)
         pending = self._pending_heading.get(chat_id, None)
@@ -1250,7 +1251,7 @@ class WeixinChannel(BaseChannel):
 
         if metadata and metadata.get("_stream_end"):
             await self._flush_stream_end(chat_id, pending, incomplete, ctx_token)
-        return
+            await self._stop_typing(chat_id, clear_remote=True)
 
     async def _send_text(
         self,
@@ -1302,33 +1303,6 @@ class WeixinChannel(BaseChannel):
         except Exception as e:
             logger.warning("[Weixin] Failed to get config for user_id={}: {}", to_user_id, e)
             return {}
-
-    async def _send_typing(self, to_user_id: str, status: int = 1) -> None:
-        """
-        发送正在输入/取消输入状态到微信服务器。
-        该状态会持续15秒，重复发送会先取消输入状态然后重新显示正在输入
-        该方法比较耗时，不要一直调用，建议在 send_delta 开始时调用一次 sendTyping(status=1)，结束时调用一次 sendTyping(status=2)
-        status: 1=typing, 2=cancel typing
-        """
-        # 自动获取 typing_ticket
-        ticket = (await self._get_config(to_user_id)).get("typing_ticket")
-        # logger.info("[Weixin] auto-fetched typing_ticket for user_id={}: {}", to_user_id, ticket)
-
-        if not ticket:
-            logger.warning("[Weixin] typing_ticket missing, skip sendTyping for user_id={}", to_user_id)
-            return
-        body = {
-            "ilink_user_id": to_user_id,
-            "typing_ticket": ticket,
-            "status": status,
-            "base_info": BASE_INFO,
-        }
-        try:
-            logger.debug("WeChat sendTyping sending: user_id={} status={}", to_user_id, status)
-            await self._api_post("ilink/bot/sendtyping", body)
-            logger.debug("WeChat sendTyping sent: user_id={} status={}", to_user_id, status)
-        except Exception as e:
-            logger.warning("WeChat sendTyping failed: {}", e)
 
     async def _send_media_file(
         self,
