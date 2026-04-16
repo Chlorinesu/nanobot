@@ -1162,63 +1162,6 @@ class WeixinChannel(BaseChannel):
         def is_meaningless(s):
             return not s.strip() or s.strip() in {'---', '***', '___'}
 
-        # Helper: render **bold** as 【bold】 to preserve emphasis without markdown
-        def render_bold_in_text(s):
-            return re.sub(r'\*\*(.+?)\*\*', r'【\1】', s)
-
-        # Helper: render ```code``` blocks with --- {lang} --- delimiters, preserving language if specified
-        def render_code_block_in_text(s):
-            def process_code_block(match):
-                lang = match.group(1).strip()  # 语言：python / js 等
-                code = match.group(2).rstrip() # 代码内容
-                
-                # 按你的格式生成开头行
-                lang_part = f" {lang}" if lang else ""
-                start_line = f"--- {lang_part} ---"
-                
-                # 结尾行长度 = 开头行长度，保证视觉完全对齐
-                end_line = "-" * len(start_line)
-                
-                return f"{start_line}\n{code}\n{end_line}"
-
-            # 匹配所有 ```语言...``` 代码块（支持多行）
-            return re.sub(
-                r'```([^\n]*)\n(.*?)\n```',
-                process_code_block,
-                s,
-                flags=re.DOTALL
-            )
-
-        # Helper: render
-        def render_headings_in_text(s):
-            h2_count = 0
-            def number_to_emoji(n):
-                # 0️⃣1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣8️⃣9️⃣🔟
-                if n == 10:
-                    return "\U0001F51F"
-                return chr(48 + n) + "\uFE0F\u20E3"
-            def replace_title1(match):
-                title = match.group(2).strip()
-                return f"📌 【{title}】"
-            def replace_title2(match):
-                nonlocal h2_count
-                h2_count += 1
-                title = match.group(2).strip()
-                num_emoji = number_to_emoji(h2_count)
-                return f"{num_emoji} 【{title}】"
-            def replace_title3(match):
-                title = match.group(3).strip()
-                return f"{title}"
-            s = re.sub(r'^#\s+(.*)', replace_title1, s, flags=re.MULTILINE)
-            s = re.sub(r'^##\s+(.*)', replace_title2, s, flags=re.MULTILINE)
-            s = re.sub(r'^###\s+(.*)', replace_title3, s, flags=re.MULTILINE)
-            return s
-
-        def render_markdown_in_text(s):
-            s = render_bold_in_text(s)
-            s = render_code_block_in_text(s)
-            s = render_headings_in_text(s)
-            return s
 
         # Pending heading logic
         pending = self._pending_heading.get(chat_id, None)
@@ -1240,7 +1183,7 @@ class WeixinChannel(BaseChannel):
                 else:
                     text_to_send = part.strip()
             if text_to_send:
-                text_to_send = render_markdown_in_text(text_to_send)
+                # text_to_send = render_markdown_in_text(text_to_send)
                 logger.debug("WeChat send_delta sending: chat_id={} text='{}'", chat_id, text_to_send)
                 await self._send_text(chat_id, text_to_send, ctx_token)
                 await self._send_typing(chat_id, status=TYPING_STATUS_CANCELED) 
@@ -1262,7 +1205,7 @@ class WeixinChannel(BaseChannel):
                 else:
                     final = incomplete.strip()
             if final:
-                final = render_markdown_in_text(final)
+                # final = render_markdown_in_text(final)
                 logger.debug("WeChat send_delta sending: chat_id={} text='{}'", chat_id, text_to_send)
                 await self._send_text(chat_id, final, ctx_token)
                 logger.debug("WeChat send_delta sent: chat_id={} (final)", chat_id)
