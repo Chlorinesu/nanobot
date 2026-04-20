@@ -651,6 +651,49 @@ async def test_send_progress_message_keeps_typing_indicator() -> None:
     assert len(typing_cancel_calls) == 0
 
 
+@pytest.mark.asyncio
+async def test_send_delta_sends_heading_with_content_as_one_message() -> None:
+    channel, _bus = _make_channel()
+    channel._context_tokens["wx-user"] = "ctx-stream"
+    channel._send_text = AsyncMock()
+    channel._send_stream_chunk = AsyncMock()
+    channel._stop_typing = AsyncMock()
+
+    await channel.send_delta("wx-user", "# 标题A\n第一段")
+    await channel.send_delta(
+        "wx-user",
+        "\n\n第二段\n---\n# 标题B\nB内容",
+        metadata={"_stream_end": True},
+    )
+
+    channel._send_stream_chunk.assert_awaited_once_with(
+        "wx-user",
+        "# 标题A\n第一段\n第二段",
+        "ctx-stream",
+    )
+    channel._send_text.assert_awaited_once_with("wx-user", "# 标题B\nB内容", "ctx-stream")
+    channel._stop_typing.assert_awaited_once_with("wx-user", clear_remote=True)
+
+
+@pytest.mark.asyncio
+async def test_send_delta_horizontal_rule_only_ends_previous_section() -> None:
+    channel, _bus = _make_channel()
+    channel._context_tokens["wx-user"] = "ctx-stream"
+    channel._send_text = AsyncMock()
+    channel._send_stream_chunk = AsyncMock()
+    channel._stop_typing = AsyncMock()
+
+    await channel.send_delta(
+        "wx-user",
+        "# 空标题\n---\n# 标题B\nB内容",
+        metadata={"_stream_end": True},
+    )
+
+    channel._send_stream_chunk.assert_not_awaited()
+    channel._send_text.assert_awaited_once_with("wx-user", "# 标题B\nB内容", "ctx-stream")
+    channel._stop_typing.assert_awaited_once_with("wx-user", clear_remote=True)
+
+
 class _DummyHttpResponse:
     def __init__(self, *, headers: dict[str, str] | None = None, status_code: int = 200) -> None:
         self.headers = headers or {}

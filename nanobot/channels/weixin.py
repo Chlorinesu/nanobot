@@ -1147,6 +1147,24 @@ class WeixinChannel(BaseChannel):
         """Return True when text is a markdown heading line."""
         return bool(re.match(r"\s*#+\s*\S+", text.strip()))
 
+    @staticmethod
+    def _extract_heading_and_body(fragment: str) -> tuple[str | None, str]:
+        """Extract heading/body from one stream fragment.
+
+        A fragment starts a titled section only when its first non-empty line is
+        a markdown heading.
+        """
+        stripped = fragment.strip()
+        if not stripped:
+            return None, ""
+
+        lines = stripped.splitlines()
+        first = lines[0].strip() if lines else ""
+        if WeixinChannel._is_stream_heading(first):
+            body = "\n".join(lines[1:]).strip()
+            return first, body
+        return None, stripped
+
     async def _send_stream_chunk(self, chat_id: str, text: str, ctx_token: str) -> None:
         """Send one completed stream chunk and stop the typing indicator for it."""
         if not text:
@@ -1160,82 +1178,132 @@ class WeixinChannel(BaseChannel):
         await self._start_typing(chat_id, ctx_token)
         logger.debug("WeChat send_delta sent: chat_id={}", chat_id)
 
-    def _split_stream_part_at_horizontal_rule(self, part: str) -> list[str]:
-        """Split a message part around markdown horizontal rules and drop the rule lines."""
-        rule_re = re.compile(r"(?m)^[ \t]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$")
-        fragments: list[str] = []
-        start = 0
-        for match in rule_re.finditer(part):
-            prefix = part[start:match.start()]
-            if prefix:
-                fragments.append(prefix)
-            start = match.end()
-            while start < len(part) and part[start] in "\r\n":
-                start += 1
-        suffix = part[start:]
-        if suffix:
-            fragments.append(suffix)
-        return fragments
+    async def _send_stream_section(
+        self,
+        chat_id: str,
+        heading: str,
+        body: str,
+        ctx_token: str,
+        *,
+        final: bool = False,
+    ) -> None:
+        """Send one titled section as a single message."""
+        clean_heading = heading.strip()
+        clean_body = body.strip()
+        if not clean_heading or not clean_body:
+            return
+        text = f"{clean_heading}\n{clean_body}"
+        logger.debug(
+            "WeChat send_delta section: chat_id={} heading='{}' body_len={} final={}",
+            chat_id,
+            clean_heading,
+            len(clean_body),
+            final,
+        )
+        if final:
+            await self._send_text(chat_id, text, ctx_token)
+        else:
+            await self._send_stream_chunk(chat_id, text, ctx_token)
+
+    def _split_stream_part_with_delimiter_mark(self, part: str) -> list[tuple[str, bool]]:
+        """Split part by markdown horizontal rules.
+
+        Returns ``(fragment, end_of_section)`` pairs. Rule lines are not included
+        in any fragment; they only mark that the current titled section should end.
+        """
+        result: list[tuple[str, bool]] = []
+        current: list[str] = []
+
+        for line in part.splitlines():
+            if self._is_markdown_horizontal_rule(line):
+                fragment = "\n".join(current).strip()
+                result.append((fragment, True))
+                current = []
+                continue
+            current.append(line)
+
+        tail = "\n".join(current).strip()
+        result.append((tail, False))
+        return result
 
     async def _consume_stream_parts(
         self,
         chat_id: str,
         message_parts: list[str],
         ctx_token: str,
-        pending: str | None,
-    ) -> str | None:
-        """Consume complete stream parts and return the updated pending heading."""
+        pending_heading: str | None,
+        pending_body: str,
+    ) -> tuple[str | None, str]:
+        """Consume stream parts and update the current titled section buffer."""
         for part in message_parts:
-            fragments = self._split_stream_part_at_horizontal_rule(part)
-            if not fragments:
-                continue
+            for fragment, end_of_section in self._split_stream_part_with_delimiter_mark(part):
+                heading, body = self._extract_heading_and_body(fragment)
 
-            for fragment in fragments:
+                if heading is not None:
+                    if pending_heading and pending_body.strip():
+                        await self._send_stream_section(
+                            chat_id,
+                            pending_heading,
+                            pending_body,
+                            ctx_token,
+                        )
+                    pending_heading = heading
+                    pending_body = body
+                elif body:
+                    if pending_heading:
+                        pending_body = f"{pending_body}\n{body}" if pending_body else body
+                    else:
+                        await self._send_stream_chunk(chat_id, body, ctx_token)
 
-                stripped = fragment.strip()
-                if self._is_stream_heading(fragment):
-                    if pending:
-                        await self._send_stream_chunk(chat_id, pending, ctx_token)
-                    pending = stripped
-                    continue
+                if end_of_section:
+                    if pending_heading and pending_body.strip():
+                        await self._send_stream_section(
+                            chat_id,
+                            pending_heading,
+                            pending_body,
+                            ctx_token,
+                        )
+                    pending_heading = None
+                    pending_body = ""
 
-                if pending:
-                    await self._send_stream_chunk(chat_id, f"{pending}\n{stripped}", ctx_token)
-                    pending = None
-                else:
-                    await self._send_stream_chunk(chat_id, stripped, ctx_token)
-
-        return pending
+        return pending_heading, pending_body
 
     async def _flush_stream_end(
         self,
         chat_id: str,
-        pending: str | None,
-        incomplete: str,
+        pending_heading: str | None,
+        pending_body: str,
         ctx_token: str,
     ) -> None:
-        """Flush any remaining buffered stream content at end of stream."""
-        final = pending or ""
-        if incomplete:
-            stripped = incomplete.strip()
-            final = f"{final}\n{stripped}" if final else stripped
-
-        if final:
+        """Flush remaining stream content at end of stream."""
+        if pending_heading and pending_body.strip():
+            await self._send_stream_section(
+                chat_id,
+                pending_heading,
+                pending_body,
+                ctx_token,
+                final=True,
+            )
+        elif pending_body.strip():
+            final = pending_body.strip()
             logger.debug("WeChat send_delta sending: chat_id={} text='{}'", chat_id, final)
             await self._send_text(chat_id, final, ctx_token)
 
-        self._pending_heading[chat_id] = None
+        self._pending_section_heading[chat_id] = None
+        self._pending_section_body[chat_id] = ""
         self._stream_buffers[chat_id] = ""
 
     async def send_delta(self, chat_id, delta, metadata=None):
         """
-        Improved streaming: avoid sending markdown headings as separate messages, and avoid empty/meaningless paragraphs.
-        Buffer headings with their content, only send when a real content block follows or at stream end.
+        Stream by titled section: send "heading + content" as one message.
+        Markdown horizontal rules are treated as section delimiters and are not sent.
         """
         if not hasattr(self, "_stream_buffers"):
             self._stream_buffers = {}
-        if not hasattr(self, "_pending_heading"):
-            self._pending_heading = {}
+        if not hasattr(self, "_pending_section_heading"):
+            self._pending_section_heading = {}
+        if not hasattr(self, "_pending_section_body"):
+            self._pending_section_body = {}
 
         buf = self._stream_buffers.get(chat_id, "")
         ctx_token = self._context_tokens.get(chat_id, "")
@@ -1244,13 +1312,38 @@ class WeixinChannel(BaseChannel):
 
         buf = buf + delta
         message_parts, incomplete = self._split_stream_message_parts(buf)
-        pending = self._pending_heading.get(chat_id, None)
-        pending = await self._consume_stream_parts(chat_id, message_parts, ctx_token, pending)
-        self._pending_heading[chat_id] = pending
+        pending_heading = self._pending_section_heading.get(chat_id, None)
+        pending_body = self._pending_section_body.get(chat_id, "")
+        pending_heading, pending_body = await self._consume_stream_parts(
+            chat_id,
+            message_parts,
+            ctx_token,
+            pending_heading,
+            pending_body,
+        )
+        self._pending_section_heading[chat_id] = pending_heading
+        self._pending_section_body[chat_id] = pending_body
         self._stream_buffers[chat_id] = incomplete
 
         if metadata and metadata.get("_stream_end"):
-            await self._flush_stream_end(chat_id, pending, incomplete, ctx_token)
+            if incomplete:
+                pending_heading, pending_body = await self._consume_stream_parts(
+                    chat_id,
+                    [incomplete],
+                    ctx_token,
+                    self._pending_section_heading.get(chat_id, None),
+                    self._pending_section_body.get(chat_id, ""),
+                )
+                self._pending_section_heading[chat_id] = pending_heading
+                self._pending_section_body[chat_id] = pending_body
+                self._stream_buffers[chat_id] = ""
+
+            await self._flush_stream_end(
+                chat_id,
+                self._pending_section_heading.get(chat_id, None),
+                self._pending_section_body.get(chat_id, ""),
+                ctx_token,
+            )
             await self._stop_typing(chat_id, clear_remote=True)
 
     async def _send_text(
