@@ -651,6 +651,54 @@ async def test_send_progress_message_keeps_typing_indicator() -> None:
     assert len(typing_cancel_calls) == 0
 
 
+def test_split_tool_hint_lines_splits_only_top_level_calls() -> None:
+    lines = WeixinChannel._split_tool_hint_lines(
+        'read_file("/tmp/a,b.txt"), exec("echo x, y"), list_dir("/tmp")'
+    )
+
+    assert lines == [
+        'read_file("/tmp/a,b.txt"),',
+        'exec("echo x, y"),',
+        'list_dir("/tmp")',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_tool_hint_message_formats_and_keeps_typing_indicator() -> None:
+    channel, _bus = _make_channel()
+    channel._client = object()
+    channel._token = "token"
+    channel._context_tokens["wx-user"] = "ctx-2"
+    channel._typing_tickets["wx-user"] = {"ticket": "ticket-2", "next_fetch_at": 9999999999}
+    channel._send_text = AsyncMock()
+    channel._api_post = AsyncMock(return_value={"ret": 0})
+
+    await channel.send(
+        type(
+            "Msg",
+            (),
+            {
+                "chat_id": "wx-user",
+                "content": 'read_file("/tmp/a,b.txt"), exec("echo x, y"), list_dir("/tmp")',
+                "media": [],
+                "metadata": {"_progress": True, "_tool_hint": True},
+            },
+        )()
+    )
+
+    sent_text = channel._send_text.await_args.args[1]
+    assert sent_text.count("🔧 ") == 3
+    assert 'read_file("/tmp/a,b.txt")' in sent_text
+    assert 'exec("echo x, y")' in sent_text
+    assert 'list_dir("/tmp")' in sent_text
+
+    typing_cancel_calls = [
+        c for c in channel._api_post.await_args_list
+        if c.args and c.args[0] == "ilink/bot/sendtyping" and c.args[1].get("status") == 2
+    ]
+    assert len(typing_cancel_calls) == 0
+
+
 @pytest.mark.asyncio
 async def test_send_delta_sends_heading_with_content_as_one_message() -> None:
     channel, _bus = _make_channel()

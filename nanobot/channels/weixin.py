@@ -58,6 +58,7 @@ MESSAGE_STATE_FINISH = 2
 
 WEIXIN_MAX_MESSAGE_LEN = 4000
 WEIXIN_CHANNEL_VERSION = "2.1.1"
+WEIXIN_TOOL_HINT_PREFIX = "🔧"
 ILINK_APP_ID = "bot"
 
 
@@ -948,6 +949,8 @@ class WeixinChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
 
+        logger.debug("WeChat send called: chat_id={} content={} metadata={}", msg.chat_id, msg.content, msg.metadata)
+
         if not self._client or not self._token:
             logger.warning("WeChat client not initialized or not authenticated")
             return
@@ -956,11 +959,15 @@ class WeixinChannel(BaseChannel):
         except RuntimeError:
             return
 
-        is_progress = bool((msg.metadata or {}).get("_progress", False))
+        metadata = msg.metadata or {}
+        is_progress = bool(metadata.get("_progress", False))
+        is_tool_hint = bool(metadata.get("_tool_hint", False))
         if not is_progress:
             await self._stop_typing(msg.chat_id, clear_remote=True)
 
         content = msg.content.strip()
+        if is_tool_hint:
+            content = self._format_tool_hint_text(content)
         ctx_token = self._context_tokens.get(msg.chat_id, "")
         if not ctx_token:
             logger.warning(
@@ -1125,6 +1132,65 @@ class WeixinChannel(BaseChannel):
         if not stripped:
             return False
         return bool(re.match(r"^[ \t]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$", stripped))
+
+    @staticmethod
+    def _split_tool_hint_lines(tool_hint: str) -> list[str]:
+        """Split tool hint text by top-level call separators only."""
+        stripped = tool_hint.strip()
+        if not stripped:
+            return []
+
+        parts: list[str] = []
+        buf: list[str] = []
+        depth = 0
+        in_string = False
+        quote_char = ""
+        escaped = False
+
+        for i, ch in enumerate(stripped):
+            buf.append(ch)
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote_char:
+                    in_string = False
+                continue
+
+            if ch in {'"', "'"}:
+                in_string = True
+                quote_char = ch
+                continue
+
+            if ch == "(":
+                depth += 1
+                continue
+
+            if ch == ")" and depth > 0:
+                depth -= 1
+                continue
+
+            if ch == "," and depth == 0:
+                next_char = stripped[i + 1] if i + 1 < len(stripped) else ""
+                if next_char == " ":
+                    part = "".join(buf).strip()
+                    if part:
+                        parts.append(part)
+                    buf = []
+
+        tail = "".join(buf).strip()
+        if tail:
+            parts.append(tail)
+
+        return [part for part in parts if part]
+
+    @classmethod
+    def _format_tool_hint_text(cls, tool_hint: str) -> str:
+        """Render tool hint text into WeChat-friendly lines."""
+        lines = cls._split_tool_hint_lines(tool_hint)
+        return "\n".join(f"{WEIXIN_TOOL_HINT_PREFIX} {line}" for line in lines)
 
     def _split_stream_message_parts(self, text: str) -> tuple[list[str], str]:
         """Split stream text by double newline and keep tail as incomplete chunk."""
@@ -1308,7 +1374,7 @@ class WeixinChannel(BaseChannel):
         buf = self._stream_buffers.get(chat_id, "")
         ctx_token = self._context_tokens.get(chat_id, "")
 
-        logger.debug("WeChat send_delta received: chat_id={} delta='{}'", chat_id, delta)
+        logger.debug("WeChat send_delta received: chat_id={} delta='{}', metadata={}", chat_id, delta, metadata)
 
         buf = buf + delta
         message_parts, incomplete = self._split_stream_message_parts(buf)
